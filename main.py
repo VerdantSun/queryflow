@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import urllib.error
+import urllib.parse
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
@@ -128,6 +130,7 @@ def fetch_title(video_id: str) -> str:
 class LoadReq(BaseModel):
     url: str = ""
     transcript: str = ""
+    cached_id: str = ""
 
 
 class SummaryReq(BaseModel):
@@ -147,9 +150,32 @@ class ChatReq(BaseModel):
     language: str = "English"
 
 
+CACHE_FILE = Path(__file__).parent / "cache" / "transcripts.json"
+
+
+def load_cache() -> dict:
+    try:
+        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+FEATURED = load_cache()  # ready-made videos shipped with the site (see prefetch.py)
+SEEN: dict = {}          # transcripts fetched while the server runs (saves API credits)
+
+
 def get_transcript(vid: str) -> str:
-    """Try English/Hindi first; if neither exists, fall back to any caption track."""
-    yt = YouTubeTranscriptApi()
+    """Direct fetch with youtube-transcript-api. English/Hindi first, then any track."""
+    kwargs = {}
+    proxy = os.environ.get("YT_PROXY_URL", "").strip()
+    if proxy:
+        try:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+
+            kwargs["proxy_config"] = GenericProxyConfig(http_url=proxy, https_url=proxy)
+        except Exception:  # noqa: BLE001
+            log.warning("YT_PROXY_URL is set but proxy support could not be loaded")
+    yt = YouTubeTranscriptApi(**kwargs)
     try:
         snippets = yt.fetch(vid, languages=["en", "en-US", "en-GB", "hi"])
     except Exception as e:  # noqa: BLE001
@@ -159,9 +185,28 @@ def get_transcript(vid: str) -> str:
     return " ".join(s.text for s in snippets)
 
 
-def explain_transcript_error(e: Exception) -> str:
-    n = type(e).__name__
-    tail = " Paste the transcript manually instead."
+def supadata_transcript(vid: str):
+    """Fallback that works from cloud hosts. Free key: https://dash.supadata.ai (100/month)."""
+    key = os.environ.get("SUPADATA_API_KEY", "").strip().strip("\"'").strip()
+    if not key:
+        return None
+    qs = urllib.parse.urlencode(
+        {"url": f"https://www.youtube.com/watch?v={vid}", "text": "true", "mode": "native"}
+    )
+    req = urllib.request.Request(
+        "https://api.supadata.ai/v1/transcript?" + qs, headers={"x-api-key": key}
+    )
+    with urllib.request.urlopen(req, timeout=40) as r:
+        data = json.load(r)
+    content = data.get("content")
+    if isinstance(content, list):
+        content = " ".join(c.get("text", "") for c in content)
+    return (content or "").strip() or None
+
+
+def explain_transcript_error(e) -> str:
+    n = type(e).__name__ if e else ""
+    tail = " Pick a ready example, paste the transcript, or upload a caption file."
     if n in ("IpBlocked", "RequestBlocked"):
         return "YouTube is blocking this server's IP address (common on cloud hosts)." + tail
     if n == "TranscriptsDisabled":
@@ -172,30 +217,10 @@ def explain_transcript_error(e: Exception) -> str:
         return "This video is age-restricted, so captions can't be fetched." + tail
     if n in ("NoTranscriptFound", "CouldNotRetrieveTranscript"):
         return "No captions were found for this video." + tail
-    return f"Couldn't fetch the transcript ({n})." + tail
+    return f"Couldn't fetch the transcript ({n or 'unknown error'})." + tail
 
 
-@app.get("/api/health")
-def health():
-    return {"ok": True, "has_key": bool(os.environ.get("GROQ_API_KEY", "").strip())}
-
-
-@app.post("/api/load")
-def load(req: LoadReq):
-    vid = video_id_from(req.url)
-    transcript = re.sub(r"\s+", " ", req.transcript).strip()
-    if not transcript:
-        if not vid:
-            raise HTTPException(400, "That doesn't look like a YouTube link. Paste a full video URL.")
-        try:
-            transcript = get_transcript(vid)
-        except Exception as e:  # noqa: BLE001
-            log.warning("transcript fetch failed for %s: %r", vid, e)
-            raise HTTPException(422, explain_transcript_error(e))
-    try:
-        title = fetch_title(vid) if vid else ""
-    except Exception:  # noqa: BLE001
-        title = ""
+def payload(vid, title, transcript):
     return {
         "video_id": vid,
         "title": title,
@@ -204,6 +229,81 @@ def load(req: LoadReq):
         "truncated": len(transcript) > MAX_CHARS,
         "max_chars": MAX_CHARS,
     }
+
+
+@app.get("/api/health")
+def health():
+    return {
+        "ok": True,
+        "has_key": bool(os.environ.get("GROQ_API_KEY", "").strip()),
+        "has_supadata": bool(os.environ.get("SUPADATA_API_KEY", "").strip()),
+        "featured": len(FEATURED),
+    }
+
+
+@app.get("/api/featured")
+def featured():
+    return [
+        {
+            "id": k,
+            "title": v.get("title") or k,
+            "words": len(v.get("transcript", "").split()),
+            "video_id": v.get("video_id"),
+        }
+        for k, v in FEATURED.items()
+    ]
+
+
+@app.post("/api/load")
+def load(req: LoadReq):
+    # 1) a ready example chosen from the site
+    if req.cached_id:
+        item = FEATURED.get(req.cached_id)
+        if not item:
+            raise HTTPException(404, "That ready example isn't available.")
+        return payload(item.get("video_id"), item.get("title", ""), item["transcript"])
+
+    vid = video_id_from(req.url)
+    transcript = re.sub(r"\s+", " ", req.transcript).strip()
+
+    # 2) a transcript pasted or uploaded by the visitor
+    if transcript:
+        title = ""
+        try:
+            title = fetch_title(vid) if vid else ""
+        except Exception:  # noqa: BLE001
+            pass
+        return payload(vid, title, transcript)
+
+    if not vid:
+        raise HTTPException(400, "That doesn't look like a YouTube link. Paste a full video URL.")
+
+    # 3) shipped or previously fetched copies
+    for store in (FEATURED, SEEN):
+        if vid in store:
+            item = store[vid]
+            return payload(vid, item.get("title", ""), item["transcript"])
+
+    # 4) live fetch, then the Supadata fallback
+    direct_error = None
+    try:
+        transcript = get_transcript(vid)
+    except Exception as e:  # noqa: BLE001
+        direct_error = e
+        log.warning("direct transcript fetch failed for %s: %r", vid, e)
+    if not transcript:
+        try:
+            transcript = supadata_transcript(vid) or ""
+        except urllib.error.HTTPError as e:
+            log.warning("Supadata HTTP %s for %s", e.code, vid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Supadata failed for %s: %r", vid, e)
+    if not transcript:
+        raise HTTPException(422, explain_transcript_error(direct_error))
+
+    title = fetch_title(vid)
+    SEEN[vid] = {"video_id": vid, "title": title, "transcript": transcript}
+    return payload(vid, title, transcript)
 
 
 @app.post("/api/summary")
@@ -228,3 +328,14 @@ def index():
 
 
 app.mount("/static", StaticFiles(directory=BASE), name="static")
+
+
+if __name__ == "__main__":
+    # Lets you start the site with:  python main.py
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    threading.Timer(2.0, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
