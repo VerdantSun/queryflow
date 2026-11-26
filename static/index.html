@@ -128,6 +128,7 @@ mark{background:rgba(255,109,90,.28);color:var(--text);border-radius:3px}
 .log .d{width:10px;height:10px;border-radius:50%;margin-top:.4rem;background:var(--line-2)}
 .log li[data-s=success] .d{background:var(--ok)}.log li[data-s=error] .d{background:var(--err)}
 .log .det{color:var(--muted);display:block;font-size:.82rem}
+.featured{position:relative;z-index:1;display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center;align-items:center;margin-top:1.25rem}
 .errbar{position:relative;z-index:1;max-width:640px;margin:1.25rem auto 0;text-align:center;color:var(--err);background:rgba(255,122,122,.08);border:1px solid rgba(255,122,122,.4);border-radius:10px;padding:.7rem 1rem;font-size:.95rem}
 [hidden]{display:none!important}
 
@@ -184,6 +185,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}
         <form id="urlForm"><input type="text" id="url" placeholder="https://youtube.com/watch?v=... (optional if you paste a transcript)" aria-label="YouTube link" autocomplete="off"></form>
         <button type="button" class="linkbtn" id="toggleManual" aria-expanded="false">Paste a transcript instead</button>
         <textarea id="manual" placeholder="Paste the transcript here" aria-label="Transcript" hidden></textarea>
+        <label class="linkbtn" id="fileLabel" hidden>Or upload a caption file (.txt, .srt, .vtt)<input type="file" id="file" accept=".txt,.srt,.vtt,text/plain" hidden></label>
         <div class="badge"><i></i><span class="bt">Waiting</span></div>
         <span class="port out"></span>
       </article>
@@ -215,6 +217,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}
     </div>
     <div class="runrow"><button class="btn coral lg" id="run">Execute workflow</button></div>
     <p class="errbar" id="errbar" role="alert" hidden></p>
+    <div class="featured" id="featured" hidden><span class="muted">Ready to try:</span></div>
   </div>
 
   <section class="out" id="output" hidden aria-live="polite">
@@ -376,18 +379,28 @@ function logStep(name, state, detail, ms) {
 }
 
 /* ---------- workflow ---------- */
-$('toggleManual').addEventListener('click', () => {
-  const open = $('manual').hidden;
-  $('manual').hidden = !open; $('toggleManual').setAttribute('aria-expanded', open);
+function setManual(open) {
+  $('manual').hidden = !open; $('fileLabel').hidden = !open;
+  $('toggleManual').setAttribute('aria-expanded', open);
   $('toggleManual').textContent = open ? 'Use a link instead' : 'Paste a transcript instead';
   requestAnimationFrame(drawEdges);
+}
+$('toggleManual').addEventListener('click', () => setManual($('manual').hidden));
+// caption file upload: strips SRT/VTT numbering, timestamps and tags
+$('file').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const raw = await f.text();
+  $('manual').value = raw.split(/\r?\n/)
+    .filter(l => l.trim() && !/^WEBVTT/i.test(l) && !/^\d+$/.test(l.trim()) && !/-->/.test(l))
+    .map(l => l.replace(/<[^>]+>/g, '').trim()).join(' ');
+  e.target.value = '';
 });
 $('urlForm').addEventListener('submit', e => { e.preventDefault(); run(); });
-$('run').addEventListener('click', run);
+$('run').addEventListener('click', () => run());
 
-async function run() {
+async function run(cachedId = '') {
   if (S.running) return;
-  const url = $('url').value.trim(), manual = $('manual').hidden ? '' : $('manual').value.trim();
+  const url = $('url').value.trim(), manual = cachedId || $('manual').hidden ? '' : $('manual').value.trim();
   NODES.forEach(n => setStatus(n, 'idle', 'Waiting'));
   $('errbar').hidden = true;
   S.log = []; S.summaries = {}; S.messages = []; S.transcript = '';
@@ -395,15 +408,15 @@ async function run() {
   $('output').hidden = false; $('vhead').hidden = true; $('sumOut').innerHTML = ''; $('dlSum').hidden = true;
   $('chatBox').hidden = true; $('chatEmpty').hidden = false; $('dlChat').hidden = $('clearChat').hidden = true;
 
-  if (!manual && !/(?:v=|youtu\.be\/|shorts\/|embed\/)[A-Za-z0-9_-]{11}/.test(url)) {
+  if (!cachedId && !manual && !/(?:v=|youtu\.be\/|shorts\/|embed\/)[A-Za-z0-9_-]{11}/.test(url)) {
     setStatus('trigger', 'error', 'No valid link');
     logStep('YouTube link', 'error', 'Paste a full YouTube video URL, or a transcript.');
     fail('Paste a full YouTube video URL, or open "Paste a transcript instead" and add one.');
     showTab('log'); return;
   }
   S.running = true; $('run').disabled = true; $('run').textContent = 'Running...';
-  setStatus('trigger', 'success', manual ? 'Transcript pasted' : 'Link ok');
-  logStep('YouTube link', 'success', manual ? 'Using pasted transcript' : url, 0);
+  setStatus('trigger', 'success', cachedId ? 'Ready example' : manual ? 'Transcript pasted' : 'Link ok');
+  logStep('YouTube link', 'success', cachedId ? 'Using a ready example' : manual ? 'Using pasted transcript' : url, 0);
   $('output').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   showTab('log');
 
@@ -411,7 +424,7 @@ async function run() {
   setStatus('transcript', 'running', 'Running');
   let t0 = performance.now();
   try {
-    const d = await api('load', { url, transcript: manual });
+    const d = await api('load', { url, transcript: manual, cached_id: cachedId });
     const ms = performance.now() - t0;
     S.transcript = d.transcript;
     setStatus('transcript', 'success', `${d.words.toLocaleString()} words · ${secs(ms)}`);
@@ -428,6 +441,7 @@ async function run() {
     setStatus('transcript', 'error', 'Failed');
     logStep('Get transcript', 'error', x.message, performance.now() - t0);
     fail(x.message);
+    if (!cachedId && /block|captions|No captions/i.test(x.message)) setManual(true);
     S.running = false; $('run').disabled = false; $('run').textContent = 'Execute workflow'; return;
   }
 
@@ -513,6 +527,15 @@ $('search').addEventListener('input', e => {
   });
 });
 $('dlTx').addEventListener('click', () => download('transcript.txt', S.transcript));
+fetch('/api/featured').then(r => r.json()).then(list => {
+  if (!Array.isArray(list) || !list.length) return;
+  list.forEach(v => {
+    const b = document.createElement('button'); b.className = 'chip'; b.type = 'button';
+    b.textContent = v.title; b.title = `${v.words.toLocaleString()} words`;
+    b.addEventListener('click', () => run(v.id)); $('featured').append(b);
+  });
+  $('featured').hidden = false; requestAnimationFrame(drawEdges);
+}).catch(() => {});
 $('again').addEventListener('click', () => setTimeout(() => $('url').focus(), 400));
 </script>
 </body>
